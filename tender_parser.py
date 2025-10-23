@@ -216,7 +216,12 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
         raise
 
 def load_cookies_for_auth(driver):
-    """ИСПРАВЛЕННАЯ загрузка cookies с подробным логированием"""
+    """Загрузка cookies по доменам с нормализацией значений (Edge/Windows).
+
+    - Поддерживаются форматы: чистый список или объект с ключом 'cookies'
+    - Нормализуются ключи: domain, path, secure, httpOnly, expiry/expirationDate, sameSite
+    - Cookies добавляются ПЕРЕДОМЕННО: перед добавлением переходим на нужный домен
+    """
     if STOP_PARSING:
         return False
 
@@ -227,7 +232,8 @@ def load_cookies_for_auth(driver):
 
     try:
         with open(cookies_file, 'r', encoding='utf-8') as f:
-            cookies_data = json.loads(f.read().strip())
+            raw_text = f.read().strip()
+            cookies_data = json.loads(raw_text) if raw_text else []
 
         if isinstance(cookies_data, list):
             cookies = cookies_data
@@ -239,68 +245,133 @@ def load_cookies_for_auth(driver):
 
         logger.info(f"Найдено {len(cookies)} cookies в файле")
 
-        # Переход на Яндекс Маркет ПЕРЕД загрузкой cookies
-        driver.get("https://market.yandex.ru")
-        time.sleep(1.5)  # Увеличено время ожидания
-        
-        logger.debug("Страница загружена, начинаю загрузку cookies...")
+        now = int(time.time())
 
-        loaded_count = 0
-        error_count = 0
-        
-        # УБРАНО ограничение [:20] - загружаем ВСЕ cookies
-        for i, cookie in enumerate(cookies):
+        def map_same_site(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            s = str(value).strip().lower()
+            mapping = {
+                'no_restriction': 'None',
+                'none': 'None',
+                'lax': 'Lax',
+                'strict': 'Strict',
+                'unspecified': None,
+                'unset': None
+            }
+            return mapping.get(s, None)
+
+        # Группируем cookies по доменам
+        domain_to_cookies: Dict[str, List[Dict[str, Any]]] = {}
+        important_names = {'Session_id', 'sessionid2', 'yandexuid', 'i'}
+
+        for idx, cookie in enumerate(cookies):
             if STOP_PARSING:
                 break
-            try:
-                if not isinstance(cookie, dict) or 'name' not in cookie or 'value' not in cookie:
-                    logger.debug(f"Cookie {i}: пропущен (нет name или value)")
-                    continue
+            if not isinstance(cookie, dict) or 'name' not in cookie or 'value' not in cookie:
+                logger.debug(f"Cookie {idx}: пропущен (нет name или value)")
+                continue
 
-                clean_cookie = {
-                    'name': str(cookie['name']),
-                    'value': str(cookie['value']),
+            try:
+                name = str(cookie['name'])
+                value = str(cookie['value'])
+
+                clean: Dict[str, Any] = {
+                    'name': name,
+                    'value': value,
                     'path': str(cookie.get('path', '/'))
                 }
 
-                # ВАЖНО: корректная обработка domain
-                if 'domain' in cookie:
-                    domain = str(cookie['domain'])
-                    # Убираем лидирующую точку если есть
-                    if domain.startswith('.'):
-                        domain = domain[1:]
-                    clean_cookie['domain'] = domain
-                
-                if cookie.get('secure', False):
-                    clean_cookie['secure'] = True
-                
-                # Добавляем sameSite если есть
-                if 'sameSite' in cookie:
-                    clean_cookie['sameSite'] = str(cookie['sameSite'])
+                # domain: используем cookie['domain'] или cookie['host']
+                domain_raw = cookie.get('domain') or cookie.get('host')
+                domain_norm = None
+                if domain_raw:
+                    domain_norm = str(domain_raw).lstrip('.').lower()
+                    clean['domain'] = domain_norm
 
-                driver.add_cookie(clean_cookie)
-                loaded_count += 1
-                
-                # Логируем важные cookies
-                if cookie['name'] in ['Session_id', 'sessionid2', 'yandexuid', 'i']:
-                    logger.debug(f"✓ Важный cookie загружен: {cookie['name']}")
-                    
+                # secure / httpOnly
+                if bool(cookie.get('secure', False)):
+                    clean['secure'] = True
+                if bool(cookie.get('httpOnly', False)):
+                    clean['httpOnly'] = True
+
+                # expiry: поддержим оба ключа и приведем к int
+                expiry_raw = cookie.get('expiry', cookie.get('expirationDate'))
+                if expiry_raw is not None:
+                    try:
+                        expiry_int = int(float(expiry_raw))
+                        if expiry_int > now + 60:  # игнорируем почти-просроченные
+                            clean['expiry'] = expiry_int
+                    except Exception:
+                        pass
+
+                # sameSite: приведем к ожидаемым значениям Selenium
+                same_site_mapped = map_same_site(cookie.get('sameSite') or cookie.get('same_site') or cookie.get('SameSite'))
+                if same_site_mapped:
+                    clean['sameSite'] = same_site_mapped
+                    # Для SameSite=None обязателен secure
+                    if same_site_mapped == 'None' and not clean.get('secure'):
+                        clean['secure'] = True
+
+                target_domain = domain_norm or 'market.yandex.ru'
+                domain_to_cookies.setdefault(target_domain, []).append(clean)
+
+                if name in important_names:
+                    logger.debug(f"✓ Важный cookie обнаружен: {name}@{target_domain}")
+
             except Exception as e:
-                error_count += 1
-                logger.debug(f"Cookie {i} ({cookie.get('name', '?')}): ошибка - {e}")
+                logger.debug(f"Cookie {idx} ({cookie.get('name', '?')}): ошибка нормализации - {e}")
                 continue
 
-        logger.info(f"Загружено cookies: {loaded_count} успешно, {error_count} ошибок")
-
-        if loaded_count > 0:
-            logger.debug("Обновляю страницу после загрузки cookies...")
-            driver.refresh()
-            time.sleep(1.5)  # Увеличено время ожидания
-            logger.info("✓ Авторизация через cookies завершена")
-            return True
-        else:
-            logger.error("Ни один cookie не загружен!")
+        if not domain_to_cookies:
+            logger.error("Ни один cookie не подготовлен к загрузке")
             return False
+
+        loaded_count = 0
+        error_count = 0
+
+        # Последовательность доменов: чем меньше поддоменов, тем раньше
+        # (например, yandex.ru -> passport.yandex.ru -> market.yandex.ru)
+        def domain_depth(d: str) -> int:
+            return d.count('.')
+
+        for domain in sorted(domain_to_cookies.keys(), key=domain_depth):
+            if STOP_PARSING:
+                break
+            try:
+                driver.get(f"https://{domain}/")
+                time.sleep(1.0)
+            except Exception as e:
+                logger.debug(f"Не удалось открыть https://{domain}/: {e}")
+
+            for ck in domain_to_cookies[domain]:
+                if STOP_PARSING:
+                    break
+                try:
+                    # Пробуем без явного domain, если совпадение домена уже есть
+                    # Некоторые реализации строже относятся к полю domain
+                    if 'domain' in ck and ck['domain'] != domain:
+                        ck_to_add = {k: v for k, v in ck.items() if k != 'domain'}
+                    else:
+                        ck_to_add = ck
+
+                    driver.add_cookie(ck_to_add)
+                    loaded_count += 1
+                except Exception as e:
+                    error_count += 1
+                    logger.debug(f"Cookie {ck.get('name', '?')}@{domain}: ошибка добавления - {e}")
+
+        # Переходим на Маркет и обновляемся
+        try:
+            driver.get("https://market.yandex.ru")
+            time.sleep(1.2)
+            driver.refresh()
+            time.sleep(1.0)
+        except Exception as e:
+            logger.debug(f"Не удалось обновить страницу маркета: {e}")
+
+        logger.info(f"Загружено cookies: {loaded_count} успешно, {error_count} ошибок")
+        return loaded_count > 0
 
     except Exception as e:
         logger.error(f"Ошибка загрузки cookies: {e}")
