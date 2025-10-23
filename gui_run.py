@@ -18,11 +18,32 @@ def main():
         print("🔧 Установите tkinter: apt-get install python3-tk (Linux)")
         return
     
-    edge_driver_path = os.path.join("browserdriver", "msedgedriver.exe")
-    if os.path.exists(edge_driver_path):
-        print(f"✅ Edge WebDriver найден: {edge_driver_path}")
+    # Расширенная проверка наличия msedgedriver (PATH/ENV/локально)
+    def _check_driver():
+        candidates = [
+            os.path.join("browserdriver", "msedgedriver"),
+            os.path.join("browserdriver", "msedgedriver.exe"),
+        ]
+        env_driver = os.environ.get("MSEDGEDRIVER")
+        if env_driver and os.path.exists(env_driver):
+            return env_driver
+        try:
+            import shutil as _shutil
+            which_path = _shutil.which("msedgedriver")
+            if which_path:
+                return which_path
+        except Exception:
+            pass
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return None
+
+    driver_found = _check_driver()
+    if driver_found:
+        print(f"✅ Edge WebDriver найден: {driver_found}")
     else:
-        print(f"❌ Edge WebDriver НЕ НАЙДЕН: {edge_driver_path}")
+        print("❌ Edge WebDriver НЕ НАЙДЕН (PATH/$MSEDGEDRIVER/./browserdriver)")
     
     cookies_file = os.path.expanduser("~/.yandex_parser_auth/cookies.json")
     if os.path.exists(cookies_file):
