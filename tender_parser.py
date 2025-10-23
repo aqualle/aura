@@ -263,12 +263,9 @@ def load_cookies_for_auth(driver):
                     'path': str(cookie.get('path', '/'))
                 }
 
-                # ВАЖНО: корректная обработка domain
+                # ВАЖНО: НЕ удаляем точку в начале domain - она нужна для поддоменов!
                 if 'domain' in cookie:
                     domain = str(cookie['domain'])
-                    # Убираем лидирующую точку если есть
-                    if domain.startswith('.'):
-                        domain = domain[1:]
                     clean_cookie['domain'] = domain
                 
                 if cookie.get('secure', False):
@@ -295,7 +292,23 @@ def load_cookies_for_auth(driver):
         if loaded_count > 0:
             logger.debug("Обновляю страницу после загрузки cookies...")
             driver.refresh()
-            time.sleep(1.5)  # Увеличено время ожидания
+            time.sleep(2.0)  # Увеличено время ожидания для полной загрузки
+            
+            # Проверяем, что cookies действительно применились
+            current_cookies = driver.get_cookies()
+            logger.debug(f"После обновления страницы: {len(current_cookies)} cookies в браузере")
+            
+            # Проверяем наличие важных cookies для авторизации
+            important_found = []
+            for current_cookie in current_cookies:
+                if current_cookie.get('name') in ['Session_id', 'sessionid2', 'yandexuid', 'i']:
+                    important_found.append(current_cookie['name'])
+            
+            if important_found:
+                logger.info(f"✓ Авторизационные cookies активны: {', '.join(important_found)}")
+            else:
+                logger.warning("⚠ Важные cookies для авторизации не найдены после загрузки")
+            
             logger.info("✓ Авторизация через cookies завершена")
             return True
         else:
@@ -802,17 +815,14 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
                 logger.info("✓ Авторизация успешна")
             else:
                 logger.warning("⚠ Авторизация не удалась, продолжаю без неё")
-
-        if STOP_PARSING:
-            return result
-
-        # Переход на маркет (только если не на странице поиска)
-        # cookies уже загружены в load_cookies_for_auth, поэтому пропускаем если уже на маркете
-        current_url = driver.current_url
-        if 'market.yandex.ru' not in current_url:
+        else:
+            # Если авторизация не используется, переходим на маркет
+            if STOP_PARSING:
+                return result
+            
             try:
                 driver.get("https://market.yandex.ru")
-                time.sleep(1.0)  # Немного увеличено время ожидания
+                time.sleep(1.0)
             except Exception as e:
                 logger.error(f"Ошибка перехода на маркет: {e}")
                 return result
