@@ -156,6 +156,7 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
     options.add_argument("--disable-web-security")
     options.add_argument("--disable-features=VizDisplayCompositor")
     options.add_argument("--remote-allow-origins=*")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--no-default-browser-check")
     options.add_argument("--no-first-run")
     options.add_argument("--disable-default-apps")
@@ -165,6 +166,21 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
     options.add_argument("--silent")
     options.add_argument("--page-load-strategy=eager")
     options.add_argument("--disable-images")
+    options.add_argument("--lang=ru-RU,ru")
+
+    # Настройка user-agent (можно переопределить EDGE_UA)
+    default_ua = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0"
+    )
+    ua = os.environ.get("EDGE_UA", default_ua)
+    options.add_argument(f"--user-agent={ua}")
+
+    try:
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])  # type: ignore
+        options.add_experimental_option("useAutomationExtension", False)  # type: ignore
+    except Exception:
+        pass
 
     profile_dir = None
     if use_auth:
@@ -293,8 +309,12 @@ def load_cookies_for_auth(driver):
             d = str(d).strip()
             if d.startswith('.'):
                 d = d[1:]
-            # Оставляем только домены Яндекса для безопасности
-            if 'yandex' not in d:
+            # Разрешенные суффиксы доменов (учитываем переход на ya.ru)
+            allowed_suffixes = (
+                'yandex.ru', 'yandex.com', 'yandex.by', 'yandex.kz', 'yandex.ua',
+                'ya.ru'
+            )
+            if not any(d == s or d.endswith('.' + s) for s in allowed_suffixes):
                 return None
             return d
 
@@ -350,7 +370,9 @@ def load_cookies_for_auth(driver):
                 'value': str(raw['value']),
                 'path': str(raw.get('path', '/')),
             }
-            if domain:
+            # Если hostOnly=true, домен не указываем, cookie будет привязан к текущему хосту
+            host_only = bool(raw.get('hostOnly', False))
+            if domain and not host_only:
                 clean_cookie['domain'] = domain
             if secure_flag:
                 clean_cookie['secure'] = True
@@ -361,15 +383,28 @@ def load_cookies_for_auth(driver):
             if expiry_val is not None:
                 clean_cookie['expiry'] = expiry_val
 
-            # Фолбэк: если домен не определен, считаем его market.yandex.ru
+            # Фолбэк: если домен не определен, используем market.yandex.ru; если hostOnly, используем тот же
             key_domain = domain or 'market.yandex.ru'
             domain_to_cookies[key_domain].append(clean_cookie)
 
         loaded_count = 0
         error_count = 0
 
-        # Сначала добавим куки для корневого домена (yandex.ru), затем конкретные
-        processing_order = sorted(domain_to_cookies.keys(), key=lambda d: (0 if d == 'yandex.ru' else 1, d))
+        # Сначала добавим куки для корневых доменов, затем конкретные
+        root_priority = {'yandex.ru': 0, 'ya.ru': 0}
+        processing_order = sorted(
+            domain_to_cookies.keys(),
+            key=lambda d: (root_priority.get(d, 1), d)
+        )
+
+        # Информируем какие домены будем заполнять
+        try:
+            domains_summary = ', '.join(processing_order[:10]) + (', ...' if len(processing_order) > 10 else '')
+            logger.info(f"Домены для загрузки cookies: {domains_summary or 'нет'}")
+        except Exception:
+            pass
+
+        important_names = {'Session_id', 'sessionid2', 'yandexuid', 'i'}
 
         for domain in processing_order:
             try:
@@ -386,11 +421,19 @@ def load_cookies_for_auth(driver):
                 try:
                     driver.add_cookie(ck)
                     loaded_count += 1
-                    if ck['name'] in ['Session_id', 'sessionid2', 'yandexuid', 'i']:
+                    if ck['name'] in important_names:
                         logger.debug(f"✓ Важный cookie загружен: {ck['name']} ({domain})")
                 except Exception as e:
                     error_count += 1
                     logger.debug(f"Cookie {ck.get('name', '?')}@{domain}: ошибка добавления - {e}")
+
+            # После добавления проверим наличие важных cookies на домене
+            try:
+                present = {c['name'] for c in driver.get_cookies() if c.get('name') in important_names}
+                missing = important_names - present
+                logger.debug(f"Проверка домена {domain}: важные есть [{', '.join(sorted(present))}], нет [{', '.join(sorted(missing))}]")
+            except Exception:
+                pass
 
         logger.info(f"Загружено cookies: {loaded_count} успешно, {error_count} ошибок")
 
@@ -398,9 +441,15 @@ def load_cookies_for_auth(driver):
             # Возвращаемся на маркет
             try:
                 driver.get("https://market.yandex.ru")
-                time.sleep(1.5)
+                time.sleep(1.2)
+                # Проверим наличие признаков авторизации/бизнеса в исходнике страницы
+                page = driver.page_source.lower()
+                if ('для юрлиц' in page or 'для бизнеса' in page) and 'войти' not in page:
+                    logger.info("✓ Обнаружены признаки авторизации на маркет")
+                else:
+                    logger.info("⚠ Не удалось подтвердить авторизацию по содержимому страницы")
                 driver.refresh()
-                time.sleep(1.0)
+                time.sleep(0.8)
             except Exception:
                 pass
             logger.info("✓ Авторизация через cookies завершена")
