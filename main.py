@@ -25,14 +25,43 @@ def show_banner():
     print(banner)
 
 def check_edge_driver():
-    driver_path = os.path.join("browserdriver", "msedgedriver.exe")
-    if os.path.exists(driver_path):
-        print(f"✅ Edge WebDriver найден: {driver_path}")
+    """Проверяет наличие msedgedriver в PATH/ENV/локально (Linux/Windows)."""
+    # 1) Аргумент командной строки проверяется позже, здесь общий поиск
+    candidates = [
+        os.path.join("browserdriver", "msedgedriver"),
+        os.path.join("browserdriver", "msedgedriver.exe"),
+    ]
+
+    found = None
+    # Проверяем переменную окружения
+    env_driver = os.environ.get("MSEDGEDRIVER")
+    if env_driver and os.path.exists(env_driver):
+        found = env_driver
+
+    # Проверяем PATH
+    if not found:
+        try:
+            import shutil as _shutil
+            which_path = _shutil.which("msedgedriver")
+            if which_path:
+                found = which_path
+        except Exception:
+            pass
+
+    # Проверяем локальные пути
+    if not found:
+        for c in candidates:
+            if os.path.exists(c):
+                found = c
+                break
+
+    if found:
+        print(f"✅ Edge WebDriver найден: {found}")
         return True
     else:
-        print(f"❌ Edge WebDriver не найден: {driver_path}")
-        print("📥 Скачайте msedgedriver.exe")
-        print("📁 Поместите файл в: ./browserdriver/msedgedriver.exe")
+        print("❌ Edge WebDriver не найден")
+        print("🔎 Поиск выполнялся в: PATH, $MSEDGEDRIVER и ./browserdriver/")
+        print("📥 Установите msedgedriver, добавьте в PATH или укажите --driver-path")
         return False
 
 def check_cookies():

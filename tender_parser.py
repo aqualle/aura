@@ -155,6 +155,7 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
     options.add_argument("--disable-plugins")
     options.add_argument("--disable-web-security")
     options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--remote-allow-origins=*")
     options.add_argument("--no-default-browser-check")
     options.add_argument("--no-first-run")
     options.add_argument("--disable-default-apps")
@@ -189,13 +190,54 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
         options.add_argument("--window-size=1024,600")
 
     try:
-        if driver_path:
+        # Определение пути к бинарнику Edge (Linux/Mac/Windows) при необходимости
+        try:
+            import shutil as _shutil
+            edge_binary_env = os.environ.get("EDGE_BINARY_PATH")
+            if edge_binary_env and os.path.exists(edge_binary_env):
+                options.binary_location = edge_binary_env
+            else:
+                # На Linux распространенные имена бинарника Edge
+                for candidate in ["microsoft-edge", "microsoft-edge-stable", "msedge", "msedge-stable"]:
+                    path_candidate = _shutil.which(candidate)
+                    if path_candidate:
+                        options.binary_location = path_candidate
+                        break
+        except Exception:
+            pass
+
+        # Определяем путь к драйверу: приоритет – аргумент, затем ENV, затем PATH, затем локальные пути
+        edge_driver_path = None
+        if driver_path and os.path.exists(driver_path):
             edge_driver_path = driver_path
         else:
-            edge_driver_path = os.path.join("browserdriver", "msedgedriver.exe")
+            env_driver = os.environ.get("MSEDGEDRIVER")
+            if env_driver and os.path.exists(env_driver):
+                edge_driver_path = env_driver
+            else:
+                try:
+                    import shutil as _shutil
+                    which_path = _shutil.which("msedgedriver")
+                    if which_path:
+                        edge_driver_path = which_path
+                except Exception:
+                    pass
+                if not edge_driver_path:
+                    # Проверяем локальные варианты без и с .exe
+                    local_candidates = [
+                        os.path.join("browserdriver", "msedgedriver"),
+                        os.path.join("browserdriver", "msedgedriver.exe"),
+                    ]
+                    for candidate in local_candidates:
+                        if os.path.exists(candidate):
+                            edge_driver_path = candidate
+                            break
 
-        if not os.path.exists(edge_driver_path):
-            raise FileNotFoundError(f"Edge WebDriver не найден: {edge_driver_path}")
+        if not edge_driver_path:
+            raise FileNotFoundError(
+                "Edge WebDriver не найден. Установите msedgedriver, добавьте в PATH, "
+                "или укажите --driver-path, либо переменную окружения MSEDGEDRIVER"
+            )
 
         service = Service(edge_driver_path)
         driver = webdriver.Edge(service=service, options=options)
@@ -216,7 +258,12 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
         raise
 
 def load_cookies_for_auth(driver):
-    """ИСПРАВЛЕННАЯ загрузка cookies с подробным логированием"""
+    """Надежная загрузка cookies с нормализацией и добавлением по доменам.
+
+    - Поддерживает разные форматы sameSite (un/NoRestriction -> None, lax/strict -> Lax/Strict)
+    - Конвертирует expirationDate/expires/expiry в целочисленный expiry
+    - Добавляет cookies по соответствующим доменам: yandex.ru, market.yandex.ru и т.д.
+    """
     if STOP_PARSING:
         return False
 
@@ -239,63 +286,123 @@ def load_cookies_for_auth(driver):
 
         logger.info(f"Найдено {len(cookies)} cookies в файле")
 
-        # Переход на Яндекс Маркет ПЕРЕД загрузкой cookies
-        driver.get("https://market.yandex.ru")
-        time.sleep(1.5)  # Увеличено время ожидания
-        
-        logger.debug("Страница загружена, начинаю загрузку cookies...")
+        # Нормализуем cookies и раскладываем по доменам
+        def _normalize_domain(d: Optional[str]) -> Optional[str]:
+            if not d:
+                return None
+            d = str(d).strip()
+            if d.startswith('.'):
+                d = d[1:]
+            # Оставляем только домены Яндекса для безопасности
+            if 'yandex' not in d:
+                return None
+            return d
+
+        def _normalize_samesite(val: Optional[str], secure_flag: bool) -> Tuple[Optional[str], bool]:
+            if not val:
+                return None, secure_flag
+            v = str(val).strip().lower()
+            mapping = {
+                'no_restriction': 'None',
+                'none': 'None',
+                'lax': 'Lax',
+                'strict': 'Strict',
+            }
+            out = mapping.get(v)
+            # Если SameSite=None, по современным браузерам cookie должен быть Secure
+            if out == 'None' and not secure_flag:
+                secure_flag = True
+            return out, secure_flag
+
+        def _normalize_expiry(cookie_dict: Dict[str, Any]) -> Optional[int]:
+            # Возможные ключи в экспортированных файлах расширений
+            for key in ('expiry', 'expirationDate', 'expires'):
+                if key in cookie_dict:
+                    try:
+                        val = cookie_dict[key]
+                        # большинство расширений отдают float seconds since epoch
+                        seconds = int(float(val))
+                        # отбрасываем истекшие куки
+                        if seconds <= int(time.time()):
+                            return None
+                        return seconds
+                    except Exception:
+                        return None
+            return None
+
+        from collections import defaultdict
+        domain_to_cookies: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+        for i, raw in enumerate(cookies):
+            if STOP_PARSING:
+                break
+            if not isinstance(raw, dict) or 'name' not in raw or 'value' not in raw:
+                logger.debug(f"Cookie {i}: пропущен (нет name или value)")
+                continue
+
+            domain = _normalize_domain(raw.get('domain'))
+            secure_flag = bool(raw.get('secure', False))
+            same_site, secure_flag = _normalize_samesite(raw.get('sameSite'), secure_flag)
+            expiry_val = _normalize_expiry(raw)
+
+            clean_cookie: Dict[str, Any] = {
+                'name': str(raw['name']),
+                'value': str(raw['value']),
+                'path': str(raw.get('path', '/')),
+            }
+            if domain:
+                clean_cookie['domain'] = domain
+            if secure_flag:
+                clean_cookie['secure'] = True
+            if same_site:
+                clean_cookie['sameSite'] = same_site
+            if isinstance(raw.get('httpOnly'), bool):
+                clean_cookie['httpOnly'] = raw['httpOnly']
+            if expiry_val is not None:
+                clean_cookie['expiry'] = expiry_val
+
+            # Фолбэк: если домен не определен, считаем его market.yandex.ru
+            key_domain = domain or 'market.yandex.ru'
+            domain_to_cookies[key_domain].append(clean_cookie)
 
         loaded_count = 0
         error_count = 0
-        
-        # УБРАНО ограничение [:20] - загружаем ВСЕ cookies
-        for i, cookie in enumerate(cookies):
-            if STOP_PARSING:
-                break
+
+        # Сначала добавим куки для корневого домена (yandex.ru), затем конкретные
+        processing_order = sorted(domain_to_cookies.keys(), key=lambda d: (0 if d == 'yandex.ru' else 1, d))
+
+        for domain in processing_order:
             try:
-                if not isinstance(cookie, dict) or 'name' not in cookie or 'value' not in cookie:
-                    logger.debug(f"Cookie {i}: пропущен (нет name или value)")
-                    continue
-
-                clean_cookie = {
-                    'name': str(cookie['name']),
-                    'value': str(cookie['value']),
-                    'path': str(cookie.get('path', '/'))
-                }
-
-                # ВАЖНО: корректная обработка domain
-                if 'domain' in cookie:
-                    domain = str(cookie['domain'])
-                    # Убираем лидирующую точку если есть
-                    if domain.startswith('.'):
-                        domain = domain[1:]
-                    clean_cookie['domain'] = domain
-                
-                if cookie.get('secure', False):
-                    clean_cookie['secure'] = True
-                
-                # Добавляем sameSite если есть
-                if 'sameSite' in cookie:
-                    clean_cookie['sameSite'] = str(cookie['sameSite'])
-
-                driver.add_cookie(clean_cookie)
-                loaded_count += 1
-                
-                # Логируем важные cookies
-                if cookie['name'] in ['Session_id', 'sessionid2', 'yandexuid', 'i']:
-                    logger.debug(f"✓ Важный cookie загружен: {cookie['name']}")
-                    
-            except Exception as e:
-                error_count += 1
-                logger.debug(f"Cookie {i} ({cookie.get('name', '?')}): ошибка - {e}")
+                url = f"https://{domain}"
+                driver.get(url)
+                time.sleep(1.0)
+            except Exception as nav_err:
+                logger.debug(f"Не удалось открыть {domain}: {nav_err}")
                 continue
+
+            for ck in domain_to_cookies[domain]:
+                if STOP_PARSING:
+                    break
+                try:
+                    driver.add_cookie(ck)
+                    loaded_count += 1
+                    if ck['name'] in ['Session_id', 'sessionid2', 'yandexuid', 'i']:
+                        logger.debug(f"✓ Важный cookie загружен: {ck['name']} ({domain})")
+                except Exception as e:
+                    error_count += 1
+                    logger.debug(f"Cookie {ck.get('name', '?')}@{domain}: ошибка добавления - {e}")
 
         logger.info(f"Загружено cookies: {loaded_count} успешно, {error_count} ошибок")
 
         if loaded_count > 0:
-            logger.debug("Обновляю страницу после загрузки cookies...")
-            driver.refresh()
-            time.sleep(1.5)  # Увеличено время ожидания
+            # Возвращаемся на маркет
+            try:
+                driver.get("https://market.yandex.ru")
+                time.sleep(1.5)
+                driver.refresh()
+                time.sleep(1.0)
+            except Exception:
+                pass
             logger.info("✓ Авторизация через cookies завершена")
             return True
         else:
