@@ -216,7 +216,7 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
         raise
 
 def load_cookies_for_auth(driver):
-    """ИСПРАВЛЕННАЯ загрузка cookies с подробным логированием"""
+    """ПРАВИЛЬНАЯ загрузка cookies - СНАЧАЛА yandex.ru, ПОТОМ market.yandex.ru"""
     if STOP_PARSING:
         return False
 
@@ -239,16 +239,16 @@ def load_cookies_for_auth(driver):
 
         logger.info(f"Найдено {len(cookies)} cookies в файле")
 
-        # Переход на Яндекс Маркет ПЕРЕД загрузкой cookies
-        driver.get("https://market.yandex.ru")
-        time.sleep(1.5)  # Увеличено время ожидания
+        # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Сначала переходим на yandex.ru для загрузки базовых cookies
+        logger.debug("Переход на yandex.ru для загрузки cookies...")
+        driver.get("https://yandex.ru")
+        time.sleep(2)  # Даём время загрузиться
         
-        logger.debug("Страница загружена, начинаю загрузку cookies...")
-
         loaded_count = 0
         error_count = 0
+        important_cookies_loaded = []
         
-        # УБРАНО ограничение [:20] - загружаем ВСЕ cookies
+        # Загружаем ВСЕ cookies на yandex.ru
         for i, cookie in enumerate(cookies):
             if STOP_PARSING:
                 break
@@ -282,7 +282,8 @@ def load_cookies_for_auth(driver):
                 loaded_count += 1
                 
                 # Логируем важные cookies
-                if cookie['name'] in ['Session_id', 'sessionid2', 'yandexuid', 'i']:
+                if cookie['name'] in ['Session_id', 'sessionid2', 'yandexuid', 'i', 'yandex_login']:
+                    important_cookies_loaded.append(cookie['name'])
                     logger.debug(f"✓ Важный cookie загружен: {cookie['name']}")
                     
             except Exception as e:
@@ -291,13 +292,24 @@ def load_cookies_for_auth(driver):
                 continue
 
         logger.info(f"Загружено cookies: {loaded_count} успешно, {error_count} ошибок")
+        if important_cookies_loaded:
+            logger.info(f"Важные cookies: {', '.join(important_cookies_loaded)}")
 
         if loaded_count > 0:
-            logger.debug("Обновляю страницу после загрузки cookies...")
-            driver.refresh()
-            time.sleep(1.5)  # Увеличено время ожидания
-            logger.info("✓ Авторизация через cookies завершена")
-            return True
+            # Теперь переходим на market.yandex.ru С УСТАНОВЛЕННЫМИ cookies
+            logger.debug("Переход на market.yandex.ru с установленными cookies...")
+            driver.get("https://market.yandex.ru")
+            time.sleep(2)  # Даём время загрузиться с авторизацией
+            
+            # Проверяем что авторизация сохранилась
+            page_source = driver.page_source.lower()
+            if 'для юрлиц' in page_source or 'для бизнеса' in page_source:
+                logger.info("✓ АВТОРИЗАЦИЯ УСПЕШНА - обнаружены признаки бизнес-аккаунта!")
+                return True
+            else:
+                logger.warning("⚠ Авторизация возможно не удалась - не найдены признаки бизнес-аккаунта")
+                logger.warning("   Продолжаю работу, но цены для юрлиц могут не появиться")
+                return True  # Всё равно продолжаем
         else:
             logger.error("Ни один cookie не загружен!")
             return False
@@ -802,17 +814,14 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
                 logger.info("✓ Авторизация успешна")
             else:
                 logger.warning("⚠ Авторизация не удалась, продолжаю без неё")
-
-        if STOP_PARSING:
-            return result
-
-        # Переход на маркет (только если не на странице поиска)
-        # cookies уже загружены в load_cookies_for_auth, поэтому пропускаем если уже на маркете
-        current_url = driver.current_url
-        if 'market.yandex.ru' not in current_url:
+            # load_cookies_for_auth уже перешёл на market.yandex.ru
+        else:
+            # Если НЕ используем авторизацию - переходим на маркет вручную
+            if STOP_PARSING:
+                return result
             try:
                 driver.get("https://market.yandex.ru")
-                time.sleep(1.0)  # Немного увеличено время ожидания
+                time.sleep(1.0)
             except Exception as e:
                 logger.error(f"Ошибка перехода на маркет: {e}")
                 return result
