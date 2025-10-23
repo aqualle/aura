@@ -44,8 +44,8 @@ class ParserGUI:
         self.driver_path = tk.StringVar(value="")
         self.auto_save_enabled = tk.BooleanVar(value=True)
         
-        # Cookies
-        self.cookies_file = os.path.join(app_dir, ".yandex_parser_auth", "cookies.json")
+        # Cookies - ИСПРАВЛЕН путь для соответствия с tender_parser.py
+        self.cookies_file = os.path.expanduser("~/.yandex_parser_auth/cookies.json")
         self.has_cookies = os.path.exists(self.cookies_file)
         
         self.create_widgets()

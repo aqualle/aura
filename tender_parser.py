@@ -175,7 +175,10 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
         profile_dir = app_dir / f"edge_profile_{worker_id}_{timestamp}"
         profile_dir.mkdir(parents=True, exist_ok=True)
         options.add_argument(f"--user-data-dir={profile_dir}")
+        # ВАЖНО: отключаем автозаполнение и другие функции, которые могут мешать
+        options.add_argument("--disable-features=AutofillServerCommunication")
         CREATED_PROFILES.add(str(profile_dir))
+        logger.debug(f"Создан профиль для авторизации: {profile_dir}")
     else:
         temp_dir = tempfile.mkdtemp(prefix=f"edge_temp_{uuid.uuid4().hex[:8]}_")
         options.add_argument(f"--user-data-dir={temp_dir}")
@@ -213,12 +216,13 @@ def create_driver(headless: bool = True, driver_path: Optional[str] = None, use_
         raise
 
 def load_cookies_for_auth(driver):
-    """ОРИГИНАЛЬНАЯ загрузка cookies (БЕЗ ИЗМЕНЕНИЙ!)"""
+    """ИСПРАВЛЕННАЯ загрузка cookies с подробным логированием"""
     if STOP_PARSING:
         return False
 
     cookies_file = os.path.expanduser("~/.yandex_parser_auth/cookies.json")
     if not os.path.exists(cookies_file):
+        logger.warning(f"Файл cookies не найден: {cookies_file}")
         return False
 
     try:
@@ -230,17 +234,27 @@ def load_cookies_for_auth(driver):
         elif isinstance(cookies_data, dict) and 'cookies' in cookies_data:
             cookies = cookies_data['cookies']
         else:
+            logger.error("Неверный формат cookies файла")
             return False
 
+        logger.info(f"Найдено {len(cookies)} cookies в файле")
+
+        # Переход на Яндекс Маркет ПЕРЕД загрузкой cookies
         driver.get("https://market.yandex.ru")
-        time.sleep(0.5)
+        time.sleep(1.5)  # Увеличено время ожидания
+        
+        logger.debug("Страница загружена, начинаю загрузку cookies...")
 
         loaded_count = 0
-        for cookie in cookies[:20]:  # ОРИГИНАЛЬНОЕ ограничение
+        error_count = 0
+        
+        # УБРАНО ограничение [:20] - загружаем ВСЕ cookies
+        for i, cookie in enumerate(cookies):
             if STOP_PARSING:
                 break
             try:
                 if not isinstance(cookie, dict) or 'name' not in cookie or 'value' not in cookie:
+                    logger.debug(f"Cookie {i}: пропущен (нет name или value)")
                     continue
 
                 clean_cookie = {
@@ -249,23 +263,49 @@ def load_cookies_for_auth(driver):
                     'path': str(cookie.get('path', '/'))
                 }
 
+                # ВАЖНО: корректная обработка domain
                 if 'domain' in cookie:
-                    clean_cookie['domain'] = str(cookie['domain'])
+                    domain = str(cookie['domain'])
+                    # Убираем лидирующую точку если есть
+                    if domain.startswith('.'):
+                        domain = domain[1:]
+                    clean_cookie['domain'] = domain
+                
                 if cookie.get('secure', False):
                     clean_cookie['secure'] = True
+                
+                # Добавляем sameSite если есть
+                if 'sameSite' in cookie:
+                    clean_cookie['sameSite'] = str(cookie['sameSite'])
 
                 driver.add_cookie(clean_cookie)
                 loaded_count += 1
-            except:
+                
+                # Логируем важные cookies
+                if cookie['name'] in ['Session_id', 'sessionid2', 'yandexuid', 'i']:
+                    logger.debug(f"✓ Важный cookie загружен: {cookie['name']}")
+                    
+            except Exception as e:
+                error_count += 1
+                logger.debug(f"Cookie {i} ({cookie.get('name', '?')}): ошибка - {e}")
                 continue
 
-        if loaded_count > 0:
-            driver.refresh()
-            time.sleep(0.5)
+        logger.info(f"Загружено cookies: {loaded_count} успешно, {error_count} ошибок")
 
-        return loaded_count > 0
+        if loaded_count > 0:
+            logger.debug("Обновляю страницу после загрузки cookies...")
+            driver.refresh()
+            time.sleep(1.5)  # Увеличено время ожидания
+            logger.info("✓ Авторизация через cookies завершена")
+            return True
+        else:
+            logger.error("Ни один cookie не загружен!")
+            return False
 
     except Exception as e:
+        logger.error(f"Ошибка загрузки cookies: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def extract_prices_fast(driver):
@@ -757,17 +797,22 @@ def get_prices(product_name: str, headless: bool = True, driver_path: Optional[s
 
         # Загрузка cookies для авторизации
         if use_business_auth and not STOP_PARSING:
-            load_cookies_for_auth(driver)
+            auth_success = load_cookies_for_auth(driver)
+            if auth_success:
+                logger.info("✓ Авторизация успешна")
+            else:
+                logger.warning("⚠ Авторизация не удалась, продолжаю без неё")
 
         if STOP_PARSING:
             return result
 
         # Переход на маркет (только если не на странице поиска)
+        # cookies уже загружены в load_cookies_for_auth, поэтому пропускаем если уже на маркете
         current_url = driver.current_url
         if 'market.yandex.ru' not in current_url:
             try:
                 driver.get("https://market.yandex.ru")
-                time.sleep(0.8)
+                time.sleep(1.0)  # Немного увеличено время ожидания
             except Exception as e:
                 logger.error(f"Ошибка перехода на маркет: {e}")
                 return result
